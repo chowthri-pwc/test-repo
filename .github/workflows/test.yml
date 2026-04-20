@@ -15,7 +15,7 @@ jobs:
       - name: Call LLM and update PR description
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           script: |
             const prNumber = context.payload.pull_request.number;
 
@@ -37,7 +37,9 @@ jobs:
             });
 
             const data = await response.json();
-            const llmOutput = data.choices?.[0]?.message?.content;
+            console.log(JSON.stringify(data, null, 2));
+
+            const llmOutput = data.choices?.[0]?.message?.content ?? "";
 
             await github.rest.pulls.update({
               owner: context.repo.owner,
