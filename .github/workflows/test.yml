@@ -1,47 +1,155 @@
-﻿name: Generate PR Description and Update the PR
+﻿name: Update PR Description with LLM
 
 on:
   pull_request:
     types:
       - opened
-      - reopened
       - synchronize
-      - ready_for_review
-    branches:
-      - '**'
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  generate-pr-description:
+  update-pr-description:
     runs-on: ubuntu-latest
+
+    env:
+      # Store these in GitHub Actions secrets, not directly in the YAML
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_API_URL: ${{ secrets.LLM_API_URL }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      GITHUB_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+      - name: Gather PR context
+        id: pr_context
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          set -euo pipefail
 
-      - name: Generate and update PR description
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'azure.gpt-4o-mini' }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_API_URL: ${{ github.api_url }}
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+          echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
+
+          # Get full PR details
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/pulls/$PR_NUMBER" > pr.json
+
+          # Get changed files in the PR
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" > files.json
+
+          # Prepare compact JSON strings for later steps
+          jq -c '{
+            number,
+            title,
+            body,
+            head_ref: .head.ref,
+            base_ref: .base.ref,
+            user: .user.login,
+            html_url
+          }' pr.json > pr_summary.json
+
+          jq -c '[.[] | {
+            filename,
+            status,
+            additions,
+            deletions,
+            changes,
+            patch
+          }]' files.json > pr_files.json
+
+          echo "pr_summary=$(cat pr_summary.json)" >> "$GITHUB_OUTPUT"
+          echo "pr_files=$(cat pr_files.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Call LLM to generate PR description
+        id: llm
+        shell: bash
         run: |
-          python scripts/generate_pr_description.py
+          set -euo pipefail
+
+          cat > prompt.txt <<'EOF'
+          You are an expert engineering assistant.
+
+          Your task is to generate a professional GitHub Pull Request description in Markdown.
+
+          Requirements:
+          - Return ONLY the PR description body in valid Markdown.
+          - Keep it concise but useful.
+          - Include these sections:
+            ## Summary
+            ## Changes
+            ## Testing
+            ## Risks / Notes
+          - If testing details are not obvious, say "Not provided".
+          - If risks are not obvious, say "No major risks identified".
+          - Do not wrap the response in code fences.
+          EOF
+
+          jq -n \
+            --rawfile system_prompt prompt.txt \
+            --arg pr '${{ steps.pr_context.outputs.pr_summary }}' \
+            --arg files '${{ steps.pr_context.outputs.pr_files }}' \
+            --arg model "$LLM_MODEL" \
+            '{
+              model: $model,
+              messages: [
+                {
+                  role: "system",
+                  content: $system_prompt
+                },
+                {
+                  role: "user",
+                  content:
+                    "Pull Request metadata:\n" + $pr +
+                    "\n\nChanged files and patches:\n" + $files
+                }
+              ],
+              temperature: 0.2
+            }' > llm-request.json
+
+          # Assumes your PwC LLM gateway is OpenAI-compatible.
+          # Common compatible route:
+          #   $LLM_API_URL/v1/chat/completions
+          #
+          # If your gateway expects a different route/payload, only this curl call
+          # and the response parsing below need adjustment.
+          curl -sS -X POST \
+            "${LLM_API_URL%/}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $LLM_API_KEY" \
+            -d @llm-request.json > llm-response.json
+
+          echo "LLM raw response:"
+          cat llm-response.json
+
+          PR_DESCRIPTION="$(jq -r '.choices[0].message.content // empty' llm-response.json)"
+
+          if [ -z "$PR_DESCRIPTION" ]; then
+            echo "LLM response did not contain choices[0].message.content"
+            exit 1
+          fi
+
+          {
+            echo "pr_description<<EOF"
+            echo "$PR_DESCRIPTION"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update PR description
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/pulls/${{ env.PR_NUMBER }}" \
+            -f body='${{ steps.llm.outputs.pr_description }}'
