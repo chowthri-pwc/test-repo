@@ -37,7 +37,7 @@ jobs:
             });
 
             const data = await response.json();
-            const llmOutput = data.choices?.[0]?.message?.content || "LLM did not return any content.";
+            const llmOutput = data.choices?.[0]?.message?.content;
 
             await github.rest.pulls.update({
               owner: context.repo.owner,
