@@ -1,29 +1,84 @@
-name : Test workflow
+﻿name: Update PR Description
 
 on:
-    pull_request:
-        types:
-          - opened
-          - edited
-          - synchronize
-        branches:
-            - main
-            - '**'
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
 
 jobs:
-    setup-python:
-        runs-on: ubuntu-latest
+  update-pr:
+    runs-on: ubuntu-latest
 
-        steps:
-          - name: Checkout repository
-            uses: actions/checkout@v4
-    
-          - name: Set up Python
-            uses: actions/setup-python@v5
-            with:
-              python-version: '3.11'
-    
-          - name: Verify Python installation
-            run: python --version
+    steps:
+      - name: Call LLM and update PR description
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LLM_API_URL: ${{ secrets.LLM_API_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import urllib.request
 
-        
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          github_token = os.environ["GITHUB_TOKEN"]
+          llm_api_url = os.environ["LLM_API_URL"]
+          llm_api_key = os.environ["LLM_API_KEY"]
+          llm_model = os.environ["LLM_MODEL"]
+
+          # Call LLM
+          llm_payload = {
+              "model": llm_model,
+              "messages": [
+                  {
+                      "role": "user",
+                      "content": "Generate a short PR description for this pull request."
+                  }
+              ]
+          }
+
+          llm_req = urllib.request.Request(
+              url=f"{llm_api_url}/v1/chat/completions",
+              data=json.dumps(llm_payload).encode("utf-8"),
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {llm_api_key}"
+              },
+              method="POST"
+          )
+
+          with urllib.request.urlopen(llm_req) as response:
+              llm_data = json.loads(response.read().decode("utf-8"))
+
+          print(json.dumps(llm_data, indent=2))
+
+          llm_output = llm_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+          # Update PR description
+          github_payload = {
+              "body": llm_output
+          }
+
+          github_req = urllib.request.Request(
+              url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+              data=json.dumps(github_payload).encode("utf-8"),
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {github_token}",
+                  "Content-Type": "application/json"
+              },
+              method="PATCH"
+          )
+
+          with urllib.request.urlopen(github_req) as response:
+              github_data = json.loads(response.read().decode("utf-8"))
+
+          print("PR description updated successfully")
+          PY
