@@ -13,37 +13,72 @@ jobs:
 
     steps:
       - name: Call LLM and update PR description
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const prNumber = context.payload.pull_request.number;
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          LLM_API_URL: ${{ secrets.LLM_API_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python <<'PY'
+          import json
+          import os
+          import urllib.request
 
-            const response = await fetch(`${{ secrets.LLM_API_URL }}/v1/chat/completions`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${{ secrets.LLM_API_KEY }}`
-              },
-              body: JSON.stringify({
-                model: "${{ secrets.LLM_MODEL }}",
-                messages: [
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          github_token = os.environ["GITHUB_TOKEN"]
+          llm_api_url = os.environ["LLM_API_URL"]
+          llm_api_key = os.environ["LLM_API_KEY"]
+          llm_model = os.environ["LLM_MODEL"]
+
+          # Call LLM
+          llm_payload = {
+              "model": llm_model,
+              "messages": [
                   {
-                    role: "user",
-                    content: "Generate a short PR description for this pull request."
+                      "role": "user",
+                      "content": "Generate a short PR description for this pull request."
                   }
-                ]
-              })
-            });
+              ]
+          }
 
-            const data = await response.json();
-            console.log(JSON.stringify(data, null, 2));
+          llm_req = urllib.request.Request(
+              url=f"{llm_api_url}/v1/chat/completions",
+              data=json.dumps(llm_payload).encode("utf-8"),
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {llm_api_key}"
+              },
+              method="POST"
+          )
 
-            const llmOutput = data.choices?.[0]?.message?.content ?? "";
+          with urllib.request.urlopen(llm_req) as response:
+              llm_data = json.loads(response.read().decode("utf-8"))
 
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              body: llmOutput
-            });
+          print(json.dumps(llm_data, indent=2))
+
+          llm_output = llm_data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+          # Update PR description
+          github_payload = {
+              "body": llm_output
+          }
+
+          github_req = urllib.request.Request(
+              url=f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+              data=json.dumps(github_payload).encode("utf-8"),
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {github_token}",
+                  "Content-Type": "application/json"
+              },
+              method="PATCH"
+          )
+
+          with urllib.request.urlopen(github_req) as response:
+              github_data = json.loads(response.read().decode("utf-8"))
+
+          print("PR description updated successfully")
+          PY
